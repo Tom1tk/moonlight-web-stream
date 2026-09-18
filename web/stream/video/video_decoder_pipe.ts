@@ -8,6 +8,10 @@ import { videoDecoderCodecInBand } from "./codec_level"
 import { CodecStreamTranslator, H264StreamVideoTranslator, H265StreamVideoTranslator, VIDEO_DECODER_CODECS_OUT_OF_BAND } from "./annex_b_translator"
 import { DataVideoRenderer, FrameVideoRenderer, VideoDecodeUnit, VideoRendererSetup } from "./index"
 
+const CATCH_UP_WINDOW = 30
+const CATCH_UP_WINDOW_RATIO = 0.5
+const CATCH_UP_GRACE_MS = 2000
+
 export const VIDEO_DECODER_CODECS_IN_BAND: Record<keyof VideoFormats, string> = {
     // avc1 = out of band config, avc3 = in band with sps, pps, idr
     "h264": "avc3.42E01E",
@@ -194,6 +198,7 @@ export class VideoDecoderPipe implements DataVideoRenderer {
         this.reset()
 
         this.decoderSetupFinished = true
+        this.decoderSetupAt = Date.now()
 
         if ("setup" in this.base && typeof this.base.setup == "function") {
             return await this.base.setup(...arguments)
@@ -201,8 +206,10 @@ export class VideoDecoderPipe implements DataVideoRenderer {
     }
 
     private decoderSetupFinished = false
+    private decoderSetupAt = 0
     private requestedIdr = false
     private needsKeyFrame = true
+    private arrivalTimes: number[] = []
 
     private bufferedUnits: Array<VideoDecodeUnit> = []
     submitDecodeUnit(unit: VideoDecodeUnit): void {
@@ -225,6 +232,10 @@ export class VideoDecoderPipe implements DataVideoRenderer {
 
 
         if (this.translator) {
+            if (unit.type != "key" && this.needsKeyFrame) {
+                return
+            }
+
             const value = this.translator.submitDecodeUnit(unit)
             if (value.error) {
                 this.errored = true
@@ -249,12 +260,17 @@ export class VideoDecoderPipe implements DataVideoRenderer {
                 this.requestedIdr = false
             }
 
+            if (unit.type == "key") {
+                this.needsKeyFrame = false
+            }
+
             const encodedChunk = new EncodedVideoChunk({
                 type: unit.type,
                 timestamp: unit.timestampMicroseconds,
                 duration: unit.durationMicroseconds,
                 data: chunk,
             })
+            this.recordVideoArrival()
             this.decoder.decode(encodedChunk)
         } else {
             if (unit.type != "key" && this.needsKeyFrame) {
@@ -270,22 +286,36 @@ export class VideoDecoderPipe implements DataVideoRenderer {
                 duration: unit.durationMicroseconds
             })
 
+            this.recordVideoArrival()
             this.decoder.decode(chunk)
         }
     }
 
-    private reset() {
-        if (!this.translator) {
-            this.decoder.reset()
-            this.needsKeyFrame = true
+    private recordVideoArrival() {
+        this.arrivalTimes.push(Date.now())
 
+        if (this.arrivalTimes.length > CATCH_UP_WINDOW) {
+            this.arrivalTimes.shift()
+        }
+    }
+
+    private reset() {
+        this.decoder.reset()
+        this.needsKeyFrame = true
+        this.arrivalTimes = []
+
+        if (!this.translator) {
             if (this.config) {
                 this.decoder.configure(this.config)
             } else {
                 this.logger?.debug("Failed to configure VideoDecoder because of missing config", { type: "fatal" })
             }
-        } else if (this.config) {
-            this.translator.setBaseConfig(this.config)
+        } else {
+            const config = this.translator.getCurrentConfig()
+
+            if (config?.description) {
+                this.decoder.configure(config)
+            }
         }
     }
 
@@ -302,6 +332,18 @@ export class VideoDecoderPipe implements DataVideoRenderer {
                 this.reset()
             }
             console.debug(`Requesting idr because of decode queue size(${this.decoder.decodeQueueSize}) and estimated delay of the queue: ${estimatedQueueDelayMs}`)
+        }
+
+        if (this.fps > 0 && this.arrivalTimes.length >= CATCH_UP_WINDOW && Date.now() - this.decoderSetupAt > CATCH_UP_GRACE_MS) {
+            const expectedWindowMs = CATCH_UP_WINDOW * 1000 / this.fps
+            const windowMs = Date.now() - this.arrivalTimes[0]
+
+            if (windowMs < expectedWindowMs * CATCH_UP_WINDOW_RATIO && !this.requestedIdr) {
+                requestIdr = true
+                this.reset()
+
+                console.debug(`Requesting idr because video frames are arriving faster than realtime (${CATCH_UP_WINDOW} frames in ${windowMs}ms)`)
+            }
         }
 
         if ("pollRequestIdr" in this.base && typeof this.base.pollRequestIdr == "function") {
