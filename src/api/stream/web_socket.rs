@@ -1,4 +1,11 @@
-use std::{pin::pin, sync::Arc, time::Duration};
+use std::{
+    pin::pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::api::{
     bindings::{
@@ -42,9 +49,22 @@ use crate::{
     app::{AppError, host::HostId, user::AuthenticatedUser},
 };
 
+const MAX_OUTBOUND_BACKLOG_BYTES: usize = 1024 * 1024;
+const RESUME_OUTBOUND_BACKLOG_BYTES: usize = MAX_OUTBOUND_BACKLOG_BYTES / 4;
+
 enum WsData {
     Bytes(Bytes),
+    Video(Bytes),
     Text(String),
+}
+
+impl WsData {
+    fn len(&self) -> usize {
+        match self {
+            WsData::Bytes(bytes) | WsData::Video(bytes) => bytes.len(),
+            WsData::Text(text) => text.len(),
+        }
+    }
 }
 
 #[get("/host/stream/web_socket")]
@@ -222,20 +242,31 @@ async fn handle_ws(
     info!(response = ?response, "sending response to client");
 
     let (mut ws_channel_sender, mut ws_channel_receiver) = unbounded_channel();
+
+    let outbound_backlog = Arc::new(AtomicUsize::new(0));
+    let dropping_video = Arc::new(AtomicBool::new(false));
+
+    let outbound_backlog_sender = outbound_backlog.clone();
+    let dropping_video_sender = dropping_video.clone();
     spawn(
         async move {
             while let Some(data) = ws_channel_receiver.recv().await {
-                match data {
-                    WsData::Bytes(bytes) => {
-                        if ws_sender.binary(bytes).await.is_err() {
-                            break;
-                        }
-                    }
-                    WsData::Text(text) => {
-                        if ws_sender.text(text).await.is_err() {
-                            break;
-                        }
-                    }
+                if let WsData::Video(_) = &data
+                    && dropping_video_sender.load(Ordering::Relaxed)
+                {
+                    outbound_backlog_sender.fetch_sub(data.len(), Ordering::Relaxed);
+                    continue;
+                }
+
+                let len = data.len();
+                let result = match data {
+                    WsData::Bytes(bytes) | WsData::Video(bytes) => ws_sender.binary(bytes).await,
+                    WsData::Text(text) => ws_sender.text(text).await,
+                };
+                outbound_backlog_sender.fetch_sub(len, Ordering::Relaxed);
+
+                if result.is_err() {
+                    break;
                 }
             }
 
@@ -245,10 +276,19 @@ async fn handle_ws(
     );
 
     // send response
-    send_ws_message(&mut ws_channel_sender, response);
+    send_ws_message(&mut ws_channel_sender, &outbound_backlog, response);
 
     // main loop
-    if let Err(err) = ws_loop(ws_channel_sender, ws_receiver, stream, control_config).await {
+    if let Err(err) = ws_loop(
+        ws_channel_sender,
+        outbound_backlog,
+        dropping_video,
+        ws_receiver,
+        stream,
+        control_config,
+    )
+    .await
+    {
         error!(error = %err, "web socket main loop errored, closing stream");
     }
 
@@ -257,6 +297,8 @@ async fn handle_ws(
 
 async fn ws_loop(
     mut ws_sender: UnboundedSender<WsData>,
+    outbound_backlog: Arc<AtomicUsize>,
+    dropping_video: Arc<AtomicBool>,
     mut ws_receiver: MessageStream,
     mut stream: MoonlightStream,
     control_config: ControlPacketConfig,
@@ -286,7 +328,7 @@ async fn ws_loop(
 
                         buffer[0] = WebSocketChannel::AUDIO;
 
-                        let _ = ws_sender.send(WsData::Bytes(buffer.into()));
+                        let _ = queue_ws_data(&ws_sender, &outbound_backlog, WsData::Bytes(buffer.into()));
                     }
                     MoonlightStreamEvent::Video(VideoStreamEvent::SignalIdr) => {
                         if let Err(err)=  stream.send_raw(ControlPacket::RequestIdr) {
@@ -298,22 +340,51 @@ async fn ws_loop(
                             continue;
                         }
 
+                        // TODO: make frame type from video packet public, 2==Idr
+                        let is_idr = frame.metadata().frame_type.serialize() == 2;
+                        let backlog = outbound_backlog.load(Ordering::Relaxed);
+
+                        if dropping_video.load(Ordering::Relaxed) {
+                            if !is_idr || backlog > RESUME_OUTBOUND_BACKLOG_BYTES {
+                                if is_idr
+                                    && let Err(err) = stream.send_raw(ControlPacket::RequestIdr)
+                                {
+                                    warn!(error = %err, "failed to request idr after dropping video frames");
+                                }
+
+                                continue;
+                            }
+
+                            dropping_video.store(false, Ordering::Relaxed);
+                        } else if backlog > MAX_OUTBOUND_BACKLOG_BYTES {
+                            warn!(
+                                backlog = backlog,
+                                "web socket video backlog too large, dropping video until the next idr"
+                            );
+                            dropping_video.store(true, Ordering::Relaxed);
+
+                            if let Err(err) = stream.send_raw(ControlPacket::RequestIdr) {
+                                warn!(error = %err, "failed to request idr after dropping video frames");
+                            }
+
+                            continue;
+                        }
+
                         // TODO: avoid using payloading and depayloading the frame like this
                         let mut buffer = vec![0; 1 + 5 + frame.raw().len()];
                         buffer[(1 + 5)..].copy_from_slice(frame.raw());
 
                         buffer[0] = WebSocketChannel::VIDEO;
-                        // TODO: make frame type from video packet public, 2==Idr
-                        buffer[1] = if frame.metadata().frame_type.serialize() == 2 {
-                            1
-                        } else {
-                            0
-                        };
+                        buffer[1] = if is_idr { 1 } else { 0 };
                         buffer[2..6].copy_from_slice(
                             &(frame.metadata().timestamp.as_micros() as u32).to_be_bytes(),
                         );
 
-                        let _ = ws_sender.send(WsData::Bytes(buffer.into()));
+                        let _ = queue_ws_data(
+                            &ws_sender,
+                            &outbound_backlog,
+                            WsData::Video(buffer.into()),
+                        );
                     }
                     MoonlightStreamEvent::Control(ControlStreamEvent::Packet(packet)) => {
                         let mut buffer = vec![0; ControlPacket::MAX_SIZE + 1];
@@ -326,7 +397,7 @@ async fn ws_loop(
                             .unwrap();
 
                         buffer.truncate(1 + packet_len);
-                        let _ = ws_sender.send(WsData::Bytes(buffer.into()));
+                        let _ = queue_ws_data(&ws_sender, &outbound_backlog, WsData::Bytes(buffer.into()));
                     }
                     _ => {}
                 }
@@ -343,6 +414,7 @@ async fn ws_loop(
 
                 send_ws_message(
                     &mut ws_sender,
+                    &outbound_backlog,
                     WebSocketClientboundMessage::Stats(StreamStatsClientboundMessage::RelayRtt {
                         rtt_ms: rtt.rtt.as_millis() as u32,
                         rtt_variance_ms: rtt.rtt_variance.as_millis() as u32,
@@ -390,7 +462,7 @@ async fn ws_loop(
                         if let WebSocketServerboundMessage::Stats(StreamStatsServerboundMessage::Ping(id)) =
                             message
                         {
-                            send_ws_message(&mut ws_sender, WebSocketClientboundMessage::Stats(StreamStatsClientboundMessage::Pong(id)));
+                            send_ws_message(&mut ws_sender, &outbound_backlog, WebSocketClientboundMessage::Stats(StreamStatsClientboundMessage::Pong(id)));
                         }
                     }
                     Message::Close(_) => {
@@ -411,8 +483,26 @@ async fn ws_loop(
     Ok(())
 }
 
+fn queue_ws_data(
+    sender: &UnboundedSender<WsData>,
+    outbound_backlog: &AtomicUsize,
+    data: WsData,
+) -> bool {
+    let len = data.len();
+    outbound_backlog.fetch_add(len, Ordering::Relaxed);
+
+    if let Err(err) = sender.send(data) {
+        outbound_backlog.fetch_sub(len, Ordering::Relaxed);
+        warn!(error = %err, "failed to send web socket message");
+        return false;
+    }
+
+    true
+}
+
 fn send_ws_message(
     sender: &mut UnboundedSender<WsData>,
+    outbound_backlog: &AtomicUsize,
     message: WebSocketClientboundMessage,
 ) -> bool {
     trace!(message = ?message, "sending text message to client");
@@ -425,10 +515,5 @@ fn send_ws_message(
         }
     };
 
-    if let Err(err) = sender.send(WsData::Text(text)) {
-        warn!(error = %err, "failed to send web socket message");
-        return false;
-    }
-
-    true
+    queue_ws_data(sender, outbound_backlog, WsData::Text(text))
 }
