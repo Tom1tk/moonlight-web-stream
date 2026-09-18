@@ -8,11 +8,9 @@ import { videoDecoderCodecInBand } from "./codec_level"
 import { CodecStreamTranslator, H264StreamVideoTranslator, H265StreamVideoTranslator, VIDEO_DECODER_CODECS_OUT_OF_BAND } from "./annex_b_translator"
 import { DataVideoRenderer, FrameVideoRenderer, VideoDecodeUnit, VideoRendererSetup } from "./index"
 
-const CATCH_UP_WINDOW = 30
-const CATCH_UP_LIVE_WINDOW = 15
-const CATCH_UP_WINDOW_RATIO = 0.5
-const CATCH_UP_LIVE_RATIO = 0.8
-const CATCH_UP_GRACE_MS = 2000
+const CATCH_UP_BACKLOG_MS = 500
+const CATCH_UP_LIVE_BACKLOG_MS = 150
+const CATCH_UP_GRACE_MS = 1500
 const IDR_RETRY_MS = 2000
 
 export const VIDEO_DECODER_CODECS_IN_BAND: Record<keyof VideoFormats, string> = {
@@ -211,9 +209,11 @@ export class VideoDecoderPipe implements DataVideoRenderer {
     private requestedIdr = false
     private needsKeyFrame = true
     private resyncing = false
-    private lastResetAt = 0
+    private lastResumeAt = 0
     private lastIdrRequestAt = 0
-    private arrivalTimes: number[] = []
+    private latestTimestampUs = 0
+    private clockBaseTsUs: number | null = null
+    private clockBaseWallMs = 0
 
     private bufferedUnits: Array<VideoDecodeUnit> = []
     submitDecodeUnit(unit: VideoDecodeUnit): void {
@@ -234,7 +234,7 @@ export class VideoDecoderPipe implements DataVideoRenderer {
             }
         }
 
-        this.recordVideoArrival()
+        this.noteVideoUnit(unit.timestampMicroseconds)
 
         if (this.resyncing) {
             // We are behind on a stall and dropping to live: drop everything, including key frames.
@@ -273,6 +273,9 @@ export class VideoDecoderPipe implements DataVideoRenderer {
             }
 
             if (unit.type == "key") {
+                if (this.needsKeyFrame) {
+                    this.resumeFromKeyFrame(unit.timestampMicroseconds)
+                }
                 this.needsKeyFrame = false
             }
 
@@ -286,6 +289,9 @@ export class VideoDecoderPipe implements DataVideoRenderer {
         } else {
             if (unit.type != "key" && this.needsKeyFrame) {
                 return
+            }
+            if (unit.type == "key" && this.needsKeyFrame) {
+                this.resumeFromKeyFrame(unit.timestampMicroseconds)
             }
             this.needsKeyFrame = false
             this.requestedIdr = false
@@ -301,20 +307,41 @@ export class VideoDecoderPipe implements DataVideoRenderer {
         }
     }
 
-    private recordVideoArrival() {
-        this.arrivalTimes.push(Date.now())
-
-        if (this.arrivalTimes.length > CATCH_UP_WINDOW) {
-            this.arrivalTimes.shift()
+    private noteVideoUnit(timestampUs: number) {
+        if (this.clockBaseTsUs === null || timestampUs < this.clockBaseTsUs) {
+            this.clockBaseTsUs = timestampUs
+            this.clockBaseWallMs = Date.now()
+            this.latestTimestampUs = timestampUs
+            return
         }
+
+        if (timestampUs > this.latestTimestampUs) {
+            this.latestTimestampUs = timestampUs
+        }
+    }
+
+    private videoBacklogMs(): number {
+        if (this.clockBaseTsUs === null) {
+            return 0
+        }
+
+        const streamElapsedMs = (this.latestTimestampUs - this.clockBaseTsUs) / 1000
+        const wallElapsedMs = Date.now() - this.clockBaseWallMs
+
+        return Math.max(0, wallElapsedMs - streamElapsedMs)
+    }
+
+    private resumeFromKeyFrame(timestampUs: number) {
+        this.lastResumeAt = Date.now()
+        this.clockBaseTsUs = timestampUs
+        this.clockBaseWallMs = this.lastResumeAt
+        this.latestTimestampUs = Math.max(this.latestTimestampUs, timestampUs)
     }
 
     private reset(resync = true) {
         this.decoder.reset()
         this.needsKeyFrame = true
         this.resyncing = resync
-        this.arrivalTimes = []
-        this.lastResetAt = Date.now()
 
         if (!this.translator) {
             if (this.config) {
@@ -335,41 +362,28 @@ export class VideoDecoderPipe implements DataVideoRenderer {
         let requestIdr = false
 
         const now = Date.now()
-        const expectedWindowMs = this.fps > 0 ? CATCH_UP_WINDOW * 1000 / this.fps : 0
-        const expectedLiveWindowMs = this.fps > 0 ? CATCH_UP_LIVE_WINDOW * 1000 / this.fps : 0
-        const catchUpWindowMs = this.arrivalTimes.length >= CATCH_UP_WINDOW ? now - this.arrivalTimes[0] : null
-        const liveWindowMs = this.arrivalTimes.length >= CATCH_UP_LIVE_WINDOW ? now - this.arrivalTimes[this.arrivalTimes.length - CATCH_UP_LIVE_WINDOW] : null
+        const estimatedQueueDelayMs = this.fps > 0 ? this.decoder.decodeQueueSize * 1000 / this.fps : 0
+        const totalBacklogMs = this.videoBacklogMs() + estimatedQueueDelayMs
 
         if (this.resyncing) {
-            if (liveWindowMs !== null && expectedLiveWindowMs > 0 && liveWindowMs >= expectedLiveWindowMs * CATCH_UP_LIVE_RATIO) {
-                // Frames are arriving at (roughly) realtime again, get a key frame to resume decoding
+            if (totalBacklogMs < CATCH_UP_LIVE_BACKLOG_MS) {
+                // We caught up with the live edge, get a key frame to resume decoding
                 this.resyncing = false
                 requestIdr = true
 
-                console.debug(`Catch-up done, video arrivals are back to realtime (${CATCH_UP_LIVE_WINDOW} frames in ${liveWindowMs}ms), requesting idr`)
+                console.debug(`Catch-up done, video is realtime again (backlog ${totalBacklogMs.toFixed(0)}ms), requesting idr`)
             }
-        } else if (catchUpWindowMs !== null && expectedWindowMs > 0 && now - this.lastResetAt > CATCH_UP_GRACE_MS && catchUpWindowMs < expectedWindowMs * CATCH_UP_WINDOW_RATIO) {
-            // We are behind: frames are arriving much faster than realtime.
-            // Drop to live instead of playing catch-up. No idr request yet: it would
-            // arrive behind the backlog and get dropped again anyway.
+        } else if (now - this.lastResumeAt > CATCH_UP_GRACE_MS && totalBacklogMs > CATCH_UP_BACKLOG_MS) {
+            // We are behind and playing catch-up: drop to live instead.
+            // No idr request yet: it would arrive behind the backlog and get dropped again anyway.
             this.reset()
 
-            console.debug(`Resyncing to live because video frames are arriving faster than realtime (${CATCH_UP_WINDOW} frames in ${catchUpWindowMs}ms)`)
+            console.debug(`Resyncing to live because video is behind by ${totalBacklogMs.toFixed(0)}ms (decoder queue ${estimatedQueueDelayMs.toFixed(0)}ms)`)
         }
 
         if (!this.resyncing && this.needsKeyFrame && this.requestedIdr && now - this.lastIdrRequestAt > IDR_RETRY_MS) {
             // We didn't receive the key frame we asked for, ask again
             requestIdr = true
-        }
-
-        const estimatedQueueDelayMs = this.decoder.decodeQueueSize * 1000 / this.fps
-        if (!this.resyncing && estimatedQueueDelayMs > 200 && this.decoder.decodeQueueSize > 2) {
-            // We have more than 200ms second backlog in the decoder
-            // -> This decoder is ass, flush that decoder and drop to live
-            if (!requestIdr && !this.requestedIdr) {
-                this.reset()
-            }
-            console.debug(`Resyncing to live because of decode queue size(${this.decoder.decodeQueueSize}) and estimated delay of the queue: ${estimatedQueueDelayMs}`)
         }
 
         if ("pollRequestIdr" in this.base && typeof this.base.pollRequestIdr == "function") {
