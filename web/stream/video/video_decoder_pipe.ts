@@ -9,8 +9,11 @@ import { CodecStreamTranslator, H264StreamVideoTranslator, H265StreamVideoTransl
 import { DataVideoRenderer, FrameVideoRenderer, VideoDecodeUnit, VideoRendererSetup } from "./index"
 
 const CATCH_UP_WINDOW = 30
+const CATCH_UP_LIVE_WINDOW = 15
 const CATCH_UP_WINDOW_RATIO = 0.5
+const CATCH_UP_LIVE_RATIO = 0.8
 const CATCH_UP_GRACE_MS = 2000
+const IDR_RETRY_MS = 2000
 
 export const VIDEO_DECODER_CODECS_IN_BAND: Record<keyof VideoFormats, string> = {
     // avc1 = out of band config, avc3 = in band with sps, pps, idr
@@ -195,10 +198,9 @@ export class VideoDecoderPipe implements DataVideoRenderer {
 
         this.logger?.debug(`VideoDecoder config: ${JSON.stringify(this.config)}`)
 
-        this.reset()
+        this.reset(false)
 
         this.decoderSetupFinished = true
-        this.decoderSetupAt = Date.now()
 
         if ("setup" in this.base && typeof this.base.setup == "function") {
             return await this.base.setup(...arguments)
@@ -206,9 +208,11 @@ export class VideoDecoderPipe implements DataVideoRenderer {
     }
 
     private decoderSetupFinished = false
-    private decoderSetupAt = 0
     private requestedIdr = false
     private needsKeyFrame = true
+    private resyncing = false
+    private lastResetAt = 0
+    private lastIdrRequestAt = 0
     private arrivalTimes: number[] = []
 
     private bufferedUnits: Array<VideoDecodeUnit> = []
@@ -230,6 +234,14 @@ export class VideoDecoderPipe implements DataVideoRenderer {
             }
         }
 
+        this.recordVideoArrival()
+
+        if (this.resyncing) {
+            // We are behind on a stall and dropping to live: drop everything, including key frames.
+            // pollRequestIdr() leaves this state and requests a key frame once frames are arriving
+            // at (roughly) realtime again.
+            return
+        }
 
         if (this.translator) {
             if (unit.type != "key" && this.needsKeyFrame) {
@@ -270,7 +282,6 @@ export class VideoDecoderPipe implements DataVideoRenderer {
                 duration: unit.durationMicroseconds,
                 data: chunk,
             })
-            this.recordVideoArrival()
             this.decoder.decode(encodedChunk)
         } else {
             if (unit.type != "key" && this.needsKeyFrame) {
@@ -286,7 +297,6 @@ export class VideoDecoderPipe implements DataVideoRenderer {
                 duration: unit.durationMicroseconds
             })
 
-            this.recordVideoArrival()
             this.decoder.decode(chunk)
         }
     }
@@ -299,10 +309,12 @@ export class VideoDecoderPipe implements DataVideoRenderer {
         }
     }
 
-    private reset() {
+    private reset(resync = true) {
         this.decoder.reset()
         this.needsKeyFrame = true
+        this.resyncing = resync
         this.arrivalTimes = []
+        this.lastResetAt = Date.now()
 
         if (!this.translator) {
             if (this.config) {
@@ -322,28 +334,42 @@ export class VideoDecoderPipe implements DataVideoRenderer {
     pollRequestIdr(): boolean {
         let requestIdr = false
 
-        const estimatedQueueDelayMs = this.decoder.decodeQueueSize * 1000 / this.fps
-        if (estimatedQueueDelayMs > 200 && this.decoder.decodeQueueSize > 2) {
-            // We have more than 200ms second backlog in the decoder
-            // -> This decoder is ass, request idr, flush that decoder
+        const now = Date.now()
+        const expectedWindowMs = this.fps > 0 ? CATCH_UP_WINDOW * 1000 / this.fps : 0
+        const expectedLiveWindowMs = this.fps > 0 ? CATCH_UP_LIVE_WINDOW * 1000 / this.fps : 0
+        const catchUpWindowMs = this.arrivalTimes.length >= CATCH_UP_WINDOW ? now - this.arrivalTimes[0] : null
+        const liveWindowMs = this.arrivalTimes.length >= CATCH_UP_LIVE_WINDOW ? now - this.arrivalTimes[this.arrivalTimes.length - CATCH_UP_LIVE_WINDOW] : null
 
-            if (!this.requestedIdr) {
+        if (this.resyncing) {
+            if (liveWindowMs !== null && expectedLiveWindowMs > 0 && liveWindowMs >= expectedLiveWindowMs * CATCH_UP_LIVE_RATIO) {
+                // Frames are arriving at (roughly) realtime again, get a key frame to resume decoding
+                this.resyncing = false
                 requestIdr = true
-                this.reset()
+
+                console.debug(`Catch-up done, video arrivals are back to realtime (${CATCH_UP_LIVE_WINDOW} frames in ${liveWindowMs}ms), requesting idr`)
             }
-            console.debug(`Requesting idr because of decode queue size(${this.decoder.decodeQueueSize}) and estimated delay of the queue: ${estimatedQueueDelayMs}`)
+        } else if (catchUpWindowMs !== null && expectedWindowMs > 0 && now - this.lastResetAt > CATCH_UP_GRACE_MS && catchUpWindowMs < expectedWindowMs * CATCH_UP_WINDOW_RATIO) {
+            // We are behind: frames are arriving much faster than realtime.
+            // Drop to live instead of playing catch-up. No idr request yet: it would
+            // arrive behind the backlog and get dropped again anyway.
+            this.reset()
+
+            console.debug(`Resyncing to live because video frames are arriving faster than realtime (${CATCH_UP_WINDOW} frames in ${catchUpWindowMs}ms)`)
         }
 
-        if (this.fps > 0 && this.arrivalTimes.length >= CATCH_UP_WINDOW && Date.now() - this.decoderSetupAt > CATCH_UP_GRACE_MS) {
-            const expectedWindowMs = CATCH_UP_WINDOW * 1000 / this.fps
-            const windowMs = Date.now() - this.arrivalTimes[0]
+        if (!this.resyncing && this.needsKeyFrame && this.requestedIdr && now - this.lastIdrRequestAt > IDR_RETRY_MS) {
+            // We didn't receive the key frame we asked for, ask again
+            requestIdr = true
+        }
 
-            if (windowMs < expectedWindowMs * CATCH_UP_WINDOW_RATIO && !this.requestedIdr) {
-                requestIdr = true
+        const estimatedQueueDelayMs = this.decoder.decodeQueueSize * 1000 / this.fps
+        if (!this.resyncing && estimatedQueueDelayMs > 200 && this.decoder.decodeQueueSize > 2) {
+            // We have more than 200ms second backlog in the decoder
+            // -> This decoder is ass, flush that decoder and drop to live
+            if (!requestIdr && !this.requestedIdr) {
                 this.reset()
-
-                console.debug(`Requesting idr because video frames are arriving faster than realtime (${CATCH_UP_WINDOW} frames in ${windowMs}ms)`)
             }
+            console.debug(`Resyncing to live because of decode queue size(${this.decoder.decodeQueueSize}) and estimated delay of the queue: ${estimatedQueueDelayMs}`)
         }
 
         if ("pollRequestIdr" in this.base && typeof this.base.pollRequestIdr == "function") {
@@ -354,6 +380,7 @@ export class VideoDecoderPipe implements DataVideoRenderer {
 
         if (requestIdr) {
             this.requestedIdr = true
+            this.lastIdrRequestAt = now
         }
 
         return requestIdr
