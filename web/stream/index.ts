@@ -110,7 +110,9 @@ const ADAPT_BITRATE_MAX_STABLE_MS = 300_000
 const ADAPT_BITRATE_PROBE_FAIL_MS = 60_000
 const ADAPT_BITRATE_MAX_BACKLOG_MS = 150
 const ADAPT_BITRATE_RECONNECT_DELAY_MS = 250
-const ADAPT_BITRATE_RESTART_FALLBACK_MS = 15_000
+const ADAPT_BITRATE_RECONNECT_RETRY_MS = 1_000
+const ADAPT_BITRATE_MAX_RECONNECT_RETRIES = 4
+const ADAPT_BITRATE_RESTART_FALLBACK_MS = 30_000
 
 function roundBitrate(kbps: number): number {
     return Math.round(kbps / ADAPT_BITRATE_ROUNDING_KBPS) * ADAPT_BITRATE_ROUNDING_KBPS
@@ -150,6 +152,7 @@ export class Stream implements Component {
     private probeTimer: ReturnType<typeof setTimeout> | null = null
     private stepUpTimer: ReturnType<typeof setTimeout> | null = null
     private restartInProgress = false
+    private adaptationRetries = 0
     private connectionGeneration = 0
     private stopped = false
 
@@ -218,6 +221,21 @@ export class Stream implements Component {
 
         if (generation != this.connectionGeneration) {
             // A bitrate adaptation restarted the connection, ignore this old attempt
+            return
+        }
+
+        if (this.restartInProgress && !this.stopped && this.adaptationRetries < ADAPT_BITRATE_MAX_RECONNECT_RETRIES) {
+            // The host may still be shutting down the previous session, retry
+            this.adaptationRetries++
+            const delayMs = ADAPT_BITRATE_RECONNECT_RETRY_MS * Math.pow(2, this.adaptationRetries - 1)
+            this.debugLog(`Failed to reconnect with the new bitrate, retrying in ${Math.round(delayMs / 1000)}s`, { type: "ifErrorDescription" })
+
+            await wait(delayMs)
+
+            if (this.stopped || !this.restartInProgress) {
+                return
+            }
+            void this.startConnection()
             return
         }
 
@@ -393,6 +411,7 @@ export class Stream implements Component {
         this.logger.debug("connected successfully, creating video and audio pipelines")
 
         this.restartInProgress = false
+        this.adaptationRetries = 0
         this.connectedAt = Date.now()
         this.scheduleStepUpCheck()
 
@@ -737,6 +756,7 @@ export class Stream implements Component {
         }
 
         this.restartInProgress = true
+        this.adaptationRetries = 0
         this.effectiveBitrate = bitrateKbps
         this.resyncTimestamps = []
         this.lastAdaptationAt = Date.now()
