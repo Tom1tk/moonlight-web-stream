@@ -11,6 +11,7 @@ export type Settings = {
     sidebarEdge: SidebarEdge,
     hideSidebarButton: boolean,
     bitrate: number
+    adaptiveBitrate: boolean
     videoSize: "720p" | "1080p" | "1440p" | "4k" | "native" | "custom"
     videoSizeCustom: {
         width: number
@@ -150,6 +151,7 @@ export class StreamSettingsComponent implements Component {
 
     private streamHeader: HTMLHeadingElement = document.createElement("h3")
     private bitrate: InputComponent
+    private adaptiveBitrate: InputComponent
     private fps: InputComponent
     private videoCodec: SelectComponent
     private forceVideoElementRenderer: InputComponent
@@ -240,6 +242,13 @@ export class StreamSettingsComponent implements Component {
         })
         this.bitrate.addChangeListener(this.onSettingsChange.bind(this))
         this.bitrate.mount(this.divElement)
+
+        // Adaptive Bitrate (WebSocket only)
+        this.adaptiveBitrate = new InputComponent("adaptiveBitrate", "checkbox", i.adaptiveBitrate, {
+            checked: settings?.adaptiveBitrate ?? defaultSettings_.adaptiveBitrate
+        })
+        this.adaptiveBitrate.addChangeListener(this.onSettingsChange.bind(this))
+        this.adaptiveBitrate.mount(this.divElement)
 
         // Fps
         this.fps = new InputComponent("fps", "number", i.fps, {
@@ -543,6 +552,7 @@ export class StreamSettingsComponent implements Component {
         settings.sidebarEdge = this.sidebarEdge.getValue() as any
         settings.hideSidebarButton = this.hideSidebarButton.isChecked()
         settings.bitrate = parseInt(this.bitrate.getValue())
+        settings.adaptiveBitrate = this.adaptiveBitrate.isChecked()
         settings.fps = parseInt(this.fps.getValue())
         settings.videoSize = this.videoSize.getValue() as any
         settings.videoSizeCustom = {

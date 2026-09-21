@@ -7,6 +7,8 @@ const trueDefaultSettings: Settings =
     "sidebarEdge": "left",
     "hideSidebarButton": false,
     "bitrate": 10000,
+    // Web socket only: lower the bitrate automatically when the connection can't keep up
+    "adaptiveBitrate": true,
     "fps": 60,
     // possible values: "720p", "1080p", "1440p", "4k", "native", "custom"
     "videoSize": "custom",

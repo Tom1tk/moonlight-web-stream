@@ -297,10 +297,7 @@ class ViewerApp implements Component {
         this.stream.addInfoListener(this.onInfo.bind(this))
 
         // Create connection info modal
-        const connectionInfo = new ConnectionInfoModal()
-        const connectionInfoListener = connectionInfo.onInfo.bind(connectionInfo)
-        this.stream.addInfoListener(connectionInfoListener)
-        showModal(connectionInfo)
+        this.showConnectionInfoModal()
 
         // Start animation frame loop
         this.onTouchUpdate()
@@ -315,6 +312,13 @@ class ViewerApp implements Component {
         }
     }
 
+    private showConnectionInfoModal() {
+        const connectionInfo = new ConnectionInfoModal()
+        const connectionInfoListener = connectionInfo.onInfo.bind(connectionInfo)
+        this.stream.addInfoListener(connectionInfoListener)
+        showModal(connectionInfo)
+    }
+
     private async onInfo(event: InfoEvent) {
         const data = event.detail
 
@@ -326,6 +330,17 @@ class ViewerApp implements Component {
             this.sidebar.onCapabilitiesChange(data.capabilities)
 
             this.armFullscreenOnNextInteraction()
+        } else if (data.type == "bitrateAdapted") {
+            if (data.reason == "degraded") {
+                showNotification(I.stream.bitrateDecreased(data.bitrateKbps), "warn")
+            } else if (data.reason == "recovered") {
+                showNotification(I.stream.bitrateIncreased(data.bitrateKbps), "info")
+            } else {
+                showNotification(I.stream.bitrateReverted(data.bitrateKbps), "info")
+            }
+
+            // The stream reconnects to change the bitrate, show the reconnect like the initial connect
+            this.showConnectionInfoModal()
         }
     }
 

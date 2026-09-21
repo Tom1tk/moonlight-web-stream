@@ -214,6 +214,20 @@ export class VideoDecoderPipe implements DataVideoRenderer {
     private latestTimestampUs = 0
     private clockBaseTsUs: number | null = null
     private clockBaseWallMs = 0
+    private resyncListener: (() => void) | null = null
+    private maxBacklogSinceReadMs = 0
+
+    /// Called whenever the pipe drops to live because it fell behind (connection congestion)
+    setResyncListener(listener: (() => void) | null) {
+        this.resyncListener = listener
+    }
+
+    /// Returns the highest total backlog seen since the last call and resets it
+    readMaxBacklogMs(): number {
+        const value = this.maxBacklogSinceReadMs
+        this.maxBacklogSinceReadMs = 0
+        return value
+    }
 
     private bufferedUnits: Array<VideoDecodeUnit> = []
     submitDecodeUnit(unit: VideoDecodeUnit): void {
@@ -343,6 +357,11 @@ export class VideoDecoderPipe implements DataVideoRenderer {
         this.needsKeyFrame = true
         this.resyncing = resync
 
+        if (resync) {
+            // Give listeners (adaptive bitrate) a chance to react to connection congestion
+            this.resyncListener?.()
+        }
+
         if (!this.translator) {
             if (this.config) {
                 this.decoder.configure(this.config)
@@ -364,6 +383,10 @@ export class VideoDecoderPipe implements DataVideoRenderer {
         const now = Date.now()
         const estimatedQueueDelayMs = this.fps > 0 ? this.decoder.decodeQueueSize * 1000 / this.fps : 0
         const totalBacklogMs = this.videoBacklogMs() + estimatedQueueDelayMs
+
+        if (totalBacklogMs > this.maxBacklogSinceReadMs) {
+            this.maxBacklogSinceReadMs = totalBacklogMs
+        }
 
         if (this.resyncing) {
             if (totalBacklogMs < CATCH_UP_LIVE_BACKLOG_MS) {

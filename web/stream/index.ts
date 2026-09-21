@@ -26,10 +26,13 @@ export type StreamCapabilities = {
     touch: boolean
 }
 
+export type BitrateAdaptionReason = "degraded" | "recovered" | "reverted"
+
 export type InfoEvent = CustomEvent<
     { type: "app", appName: string } |
     { type: "connectionComplete", capabilities: StreamCapabilities } |
     { type: "videoReady" } |
+    { type: "bitrateAdapted", bitrateKbps: number, previousBitrateKbps: number, reason: BitrateAdaptionReason } |
     { type: "addDebugLine", line: string, additional?: LogMessageInfo }
 >
 export type InfoEventListener = (event: InfoEvent) => void
@@ -92,6 +95,27 @@ function isFirefox(): boolean {
 const WEBRTC_CONNECT_TIMEOUT_MS = 15000
 const FALLBACK_RECONNECT_DELAY_MS = 500
 
+// -- Adaptive bitrate (web sockets only)
+// Sunshine and moonlight can't change the encoder bitrate mid-session, so adapting
+// the bitrate means reconnecting the host session at a different bitrate.
+const ADAPT_BITRATE_WINDOW_MS = 90_000
+const ADAPT_BITRATE_MIN_RESYNCS = 3
+const ADAPT_BITRATE_COOLDOWN_MS = 45_000
+const ADAPT_BITRATE_DEGRADE_FACTOR = 0.6
+const ADAPT_BITRATE_RECOVER_FACTOR = 1.5
+const ADAPT_BITRATE_FLOOR_KBPS = 2_000
+const ADAPT_BITRATE_ROUNDING_KBPS = 500
+const ADAPT_BITRATE_STABLE_MS = 10_000
+const ADAPT_BITRATE_MAX_STABLE_MS = 300_000
+const ADAPT_BITRATE_PROBE_FAIL_MS = 60_000
+const ADAPT_BITRATE_MAX_BACKLOG_MS = 150
+const ADAPT_BITRATE_RECONNECT_DELAY_MS = 250
+const ADAPT_BITRATE_RESTART_FALLBACK_MS = 15_000
+
+function roundBitrate(kbps: number): number {
+    return Math.round(kbps / ADAPT_BITRATE_ROUNDING_KBPS) * ADAPT_BITRATE_ROUNDING_KBPS
+}
+
 export class Stream implements Component {
     private logger: Logger = new Logger()
 
@@ -115,6 +139,19 @@ export class Stream implements Component {
     private stats: StreamStats
 
     private streamerSize: [number, number]
+
+    // -- Adaptive bitrate state
+    private effectiveBitrate: number | null = null
+    private resyncTimestamps: number[] = []
+    private lastAdaptationAt = 0
+    private connectedAt = 0
+    private stepUpStableMs = ADAPT_BITRATE_STABLE_MS
+    private probe: { fromBitrateKbps: number, at: number } | null = null
+    private probeTimer: ReturnType<typeof setTimeout> | null = null
+    private stepUpTimer: ReturnType<typeof setTimeout> | null = null
+    private restartInProgress = false
+    private connectionGeneration = 0
+    private stopped = false
 
     constructor(api: Api, hostId: number, appId: number, settings: Settings, viewerScreenSize: [number, number], permissions: StreamPermissions) {
         this.logger.addInfoListener((info, type) => {
@@ -159,6 +196,8 @@ export class Stream implements Component {
     }
 
     async startConnection() {
+        const generation = ++this.connectionGeneration
+
         this.debugLog(`Permissions: ${JSON.stringify(this.permissions)}`)
 
         const desiredTransport = this.transportOverride ?? this.settings.dataTransport
@@ -175,6 +214,11 @@ export class Stream implements Component {
             await this.tryWebRTCTransport()
         } else if (desiredTransport == "websocket") {
             await this.tryWebSocketTransport()
+        }
+
+        if (generation != this.connectionGeneration) {
+            // A bitrate adaptation restarted the connection, ignore this old attempt
+            return
         }
 
         this.debugLog("Tried all configured transport options but no connection was possible", { type: "fatal" })
@@ -211,7 +255,7 @@ export class Stream implements Component {
             width: this.streamerSize[0],
             height: this.streamerSize[1],
             fps: this.settings.fps,
-            bitrate: this.settings.bitrate,
+            bitrate: this.currentBitrateKbps(),
             hdr: this.settings.hdr,
             localAudioPlayMode: this.settings.playAudioLocal,
             supportedCodecs: dataCodecs,
@@ -347,6 +391,10 @@ export class Stream implements Component {
 
     private async onConnect(connectData: TransportConnectData) {
         this.logger.debug("connected successfully, creating video and audio pipelines")
+
+        this.restartInProgress = false
+        this.connectedAt = Date.now()
+        this.scheduleStepUpCheck()
 
         // Dispatch app event
         let event: InfoEvent = new CustomEvent("stream-info", {
@@ -487,6 +535,7 @@ export class Stream implements Component {
             await this.transport.setVideoPipeline("data", videoRenderer)
 
             this.videoRenderer = videoRenderer
+            this.attachResyncListener(videoRenderer)
         } else {
             this.debugLog(`Failed to create video pipeline with transport channel of type ${videoType} (${this.transport.implementationName})`)
             return false
@@ -541,6 +590,204 @@ export class Stream implements Component {
         return true
     }
 
+    // -- Adaptive Bitrate
+    // Only works on web sockets: WebRTC tracks give us no decoder backlog to detect congestion,
+    // and the host bitrate can't be changed mid-session (it's part of the SDP).
+    private currentBitrateKbps(): number {
+        return this.effectiveBitrate ?? this.settings.bitrate
+    }
+
+    private isAdaptiveBitrateAvailable(): boolean {
+        return this.settings.adaptiveBitrate
+            && !this.stopped
+            && this.transport instanceof WebSocketTransport
+    }
+
+    private attachResyncListener(videoRenderer: VideoRenderer) {
+        const setResyncListener = (videoRenderer as { setResyncListener?: (listener: () => void) => void }).setResyncListener
+        if (typeof setResyncListener != "function") {
+            return
+        }
+
+        try {
+            setResyncListener.call(videoRenderer, () => this.onVideoResync())
+        } catch (error) {
+            this.debugLog(`Failed to attach adaptive bitrate listener: ${error}`)
+        }
+    }
+
+    private readMaxBacklogMs(): number {
+        const readMaxBacklog = (this.videoRenderer as { readMaxBacklogMs?: () => number } | null)?.readMaxBacklogMs
+        if (typeof readMaxBacklog != "function") {
+            return 0
+        }
+
+        try {
+            return readMaxBacklog.call(this.videoRenderer)
+        } catch {
+            return 0
+        }
+    }
+
+    /// Called when the video pipe had to drop to live because it fell behind (connection congestion)
+    private onVideoResync() {
+        if (!this.isAdaptiveBitrateAvailable() || this.restartInProgress) {
+            return
+        }
+        if (typeof document != "undefined" && document.visibilityState != "visible") {
+            // Don't adapt for stalls that happen while the page isn't being drawn
+            return
+        }
+
+        const now = Date.now()
+        this.resyncTimestamps.push(now)
+        this.resyncTimestamps = this.resyncTimestamps.filter(time => now - time < ADAPT_BITRATE_WINDOW_MS)
+
+        if (this.probe && now - this.probe.at < ADAPT_BITRATE_PROBE_FAIL_MS) {
+            // The step up we just tried didn't hold, go back down
+            const targetKbps = this.probe.fromBitrateKbps
+            this.clearProbe()
+            this.stepUpStableMs = Math.min(this.stepUpStableMs * 3, ADAPT_BITRATE_MAX_STABLE_MS)
+
+            this.debugLog(`Adaptive bitrate: step up didn't hold, going back to ${targetKbps} kbps`, { type: "ifErrorDescription" })
+            void this.adaptBitrate(targetKbps, "reverted")
+            return
+        }
+
+        if (this.resyncTimestamps.length >= ADAPT_BITRATE_MIN_RESYNCS && now - this.lastAdaptationAt > ADAPT_BITRATE_COOLDOWN_MS) {
+            const currentKbps = this.currentBitrateKbps()
+            const targetKbps = Math.max(ADAPT_BITRATE_FLOOR_KBPS, roundBitrate(currentKbps * ADAPT_BITRATE_DEGRADE_FACTOR))
+
+            if (targetKbps < currentKbps) {
+                this.debugLog(`Adaptive bitrate: connection congested (${this.resyncTimestamps.length} resyncs), lowering bitrate from ${currentKbps} to ${targetKbps} kbps`, { type: "ifErrorDescription" })
+                void this.adaptBitrate(targetKbps, "degraded")
+                return
+            }
+
+            // Already at the lowest bitrate, there is nothing more we can do
+            return
+        }
+
+        this.scheduleStepUpCheck()
+    }
+
+    private scheduleStepUpCheck() {
+        if (!this.isAdaptiveBitrateAvailable()) {
+            return
+        }
+
+        if (this.stepUpTimer != null) {
+            clearTimeout(this.stepUpTimer)
+        }
+        this.stepUpTimer = setTimeout(() => {
+            this.stepUpTimer = null
+            this.checkStepUp()
+        }, this.stepUpStableMs)
+    }
+
+    private checkStepUp() {
+        if (!this.isAdaptiveBitrateAvailable()) {
+            return
+        }
+        if (this.restartInProgress || this.probe) {
+            this.scheduleStepUpCheck()
+            return
+        }
+
+        const now = Date.now()
+        const lastResyncAt = this.resyncTimestamps.length > 0 ? this.resyncTimestamps[this.resyncTimestamps.length - 1] : 0
+        if (now - Math.max(lastResyncAt, this.lastAdaptationAt, this.connectedAt) < this.stepUpStableMs) {
+            this.scheduleStepUpCheck()
+            return
+        }
+
+        const currentKbps = this.currentBitrateKbps()
+        const targetKbps = Math.min(this.settings.bitrate, roundBitrate(currentKbps * ADAPT_BITRATE_RECOVER_FACTOR))
+        if (targetKbps <= currentKbps) {
+            return
+        }
+
+        const maxBacklogMs = this.readMaxBacklogMs()
+        if (maxBacklogMs > ADAPT_BITRATE_MAX_BACKLOG_MS) {
+            // The connection is still borderline, don't push it and try again later
+            this.scheduleStepUpCheck()
+            return
+        }
+
+        this.debugLog(`Adaptive bitrate: connection looks stable again, trying ${targetKbps} kbps`, { type: "ifErrorDescription" })
+        void this.adaptBitrate(targetKbps, "recovered")
+    }
+
+    private clearProbe() {
+        this.probe = null
+        if (this.probeTimer != null) {
+            clearTimeout(this.probeTimer)
+            this.probeTimer = null
+        }
+    }
+
+    private async adaptBitrate(bitrateKbps: number, reason: BitrateAdaptionReason): Promise<void> {
+        if (this.restartInProgress || this.stopped) {
+            return
+        }
+
+        const previousBitrateKbps = this.currentBitrateKbps()
+        if (bitrateKbps == previousBitrateKbps) {
+            return
+        }
+
+        this.restartInProgress = true
+        this.effectiveBitrate = bitrateKbps
+        this.resyncTimestamps = []
+        this.lastAdaptationAt = Date.now()
+        this.readMaxBacklogMs()
+
+        if (reason == "recovered") {
+            // Watch this new bitrate for a bit, revert if it doesn't hold
+            this.probe = { fromBitrateKbps: previousBitrateKbps, at: this.lastAdaptationAt }
+            this.probeTimer = setTimeout(() => {
+                if (this.probe) {
+                    // The step up held, become less conservative again
+                    this.probe = null
+                    this.probeTimer = null
+                    this.stepUpStableMs = Math.max(ADAPT_BITRATE_STABLE_MS, Math.floor(this.stepUpStableMs / 3))
+                    this.scheduleStepUpCheck()
+                }
+            }, ADAPT_BITRATE_PROBE_FAIL_MS)
+        }
+
+        const event: InfoEvent = new CustomEvent("stream-info", {
+            detail: {
+                type: "bitrateAdapted",
+                bitrateKbps,
+                previousBitrateKbps,
+                reason
+            }
+        })
+        this.eventTarget.dispatchEvent(event)
+
+        this.debugLog(`Reconnecting with ${bitrateKbps} kbps because of ${reason == "degraded" ? "connection congestion" : reason == "recovered" ? "a recovered connection" : "an unstable connection"}`)
+
+        try {
+            // Stay on the transport that is working instead of trying WebRTC again
+            this.transportOverride = "websocket"
+
+            await this.transport?.close()
+
+            if (this.stopped) {
+                return
+            }
+
+            await wait(ADAPT_BITRATE_RECONNECT_DELAY_MS)
+            void this.startConnection()
+        } finally {
+            // onConnect resets this as soon as a connection is established again
+            setTimeout(() => {
+                this.restartInProgress = false
+            }, ADAPT_BITRATE_RESTART_FALLBACK_MS)
+        }
+    }
+
     mount(parent: HTMLElement): void {
         parent.appendChild(this.divElement)
     }
@@ -556,6 +803,14 @@ export class Stream implements Component {
     }
 
     async stop(): Promise<boolean> {
+        this.stopped = true
+
+        if (this.stepUpTimer != null) {
+            clearTimeout(this.stepUpTimer)
+            this.stepUpTimer = null
+        }
+        this.clearProbe()
+
         // Stop transport
         await this.transport?.close()
 
