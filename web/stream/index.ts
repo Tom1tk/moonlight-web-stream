@@ -792,6 +792,9 @@ export class Stream implements Component {
             // Stay on the transport that is working instead of trying WebRTC again
             this.transportOverride = "websocket"
 
+            // Supersede the running connection attempt so that it doesn't try to reconnect on its own
+            this.connectionGeneration++
+
             await this.transport?.close()
 
             if (this.stopped) {
