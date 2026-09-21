@@ -179,6 +179,8 @@ class ViewerApp implements Component {
 
     private hasShownFullscreenEscapeWarning = false
 
+    private connectionInfoListener: ((event: InfoEvent) => void) | null = null
+
     constructor(api: Api, hostId: number, appId: number, bootstrapRole: DetailedRole, options?: Partial<Settings>) {
         this.api = api
 
@@ -313,8 +315,14 @@ class ViewerApp implements Component {
     }
 
     private showConnectionInfoModal() {
+        if (this.connectionInfoListener) {
+            this.stream.removeInfoListener(this.connectionInfoListener)
+            this.connectionInfoListener = null
+        }
+
         const connectionInfo = new ConnectionInfoModal()
         const connectionInfoListener = connectionInfo.onInfo.bind(connectionInfo)
+        this.connectionInfoListener = connectionInfoListener
         this.stream.addInfoListener(connectionInfoListener)
         showModal(connectionInfo)
     }
