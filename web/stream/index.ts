@@ -766,7 +766,7 @@ export class Stream implements Component {
         })
         this.eventTarget.dispatchEvent(event)
 
-        this.debugLog(`Reconnecting with ${bitrateKbps} kbps because of ${reason == "degraded" ? "connection congestion" : reason == "recovered" ? "a recovered connection" : "an unstable connection"}`)
+        this.debugLog(`Reconnecting with ${bitrateKbps} kbps because of ${reason == "degraded" ? "connection congestion" : reason == "recovered" ? "a recovered connection" : "an unstable connection"}`, { type: "ifErrorDescription" })
 
         try {
             // Stay on the transport that is working instead of trying WebRTC again
