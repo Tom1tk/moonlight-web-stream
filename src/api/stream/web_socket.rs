@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::api::{
@@ -55,6 +55,10 @@ use crate::{
 const MAX_OUTBOUND_BACKLOG_MS: u64 = 250;
 /// Backlog that has to be drained before video frames are sent again.
 const RESUME_OUTBOUND_BACKLOG_MS: u64 = MAX_OUTBOUND_BACKLOG_MS / 4;
+/// Minimum time between two idr requests while video frames are being dropped.
+/// Requesting an idr for every dropped idr would make the host encode a keyframe
+/// for almost every frame, which wastes bandwidth and does not recover any faster.
+const IDR_RE_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Converts a duration of video at the given bitrate (in kbps) into a number of bytes.
 fn video_bytes_for_duration(bitrate_kbps: u32, duration_ms: u64) -> usize {
@@ -327,6 +331,7 @@ async fn ws_loop(
     let mut relay_stats_ticker = pin!(interval(Duration::from_secs(1)));
 
     let mut ws_stopped = false;
+    let mut last_idr_request_at = Instant::now();
 
     loop {
         if !stream.is_alive() {
@@ -367,10 +372,19 @@ async fn ws_loop(
 
                         if dropping_video.load(Ordering::Relaxed) {
                             if !is_idr || backlog > resume_outbound_backlog {
-                                if is_idr
-                                    && let Err(err) = stream.send_raw(ControlPacket::RequestIdr)
+                                // Only ask for a new idr once the backlog has drained.
+                                // Asking for one for every idr that arrives while the
+                                // backlog is still being drained makes the host encode a
+                                // keyframe for nearly every frame, and all of them get
+                                // dropped anyway.
+                                if backlog <= resume_outbound_backlog
+                                    && last_idr_request_at.elapsed() >= IDR_RE_REQUEST_INTERVAL
                                 {
-                                    warn!(error = %err, "failed to request idr after dropping video frames");
+                                    last_idr_request_at = Instant::now();
+
+                                    if let Err(err) = stream.send_raw(ControlPacket::RequestIdr) {
+                                        warn!(error = %err, "failed to request idr after dropping video frames");
+                                    }
                                 }
 
                                 continue;
@@ -384,6 +398,7 @@ async fn ws_loop(
                                 "web socket video backlog too large, dropping video until the next idr"
                             );
                             dropping_video.store(true, Ordering::Relaxed);
+                            last_idr_request_at = Instant::now();
 
                             if let Err(err) = stream.send_raw(ControlPacket::RequestIdr) {
                                 warn!(error = %err, "failed to request idr after dropping video frames");
