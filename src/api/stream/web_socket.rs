@@ -49,8 +49,20 @@ use crate::{
     app::{AppError, host::HostId, user::AuthenticatedUser},
 };
 
-const MAX_OUTBOUND_BACKLOG_BYTES: usize = 1024 * 1024;
-const RESUME_OUTBOUND_BACKLOG_BYTES: usize = MAX_OUTBOUND_BACKLOG_BYTES / 4;
+/// Maximum duration of video that may be queued for the client before the sending
+/// task starts dropping video frames. Bounding the backlog by a duration instead of
+/// a fixed number of bytes keeps the added latency roughly the same at every bitrate.
+const MAX_OUTBOUND_BACKLOG_MS: u64 = 250;
+/// Backlog that has to be drained before video frames are sent again.
+const RESUME_OUTBOUND_BACKLOG_MS: u64 = MAX_OUTBOUND_BACKLOG_MS / 4;
+
+/// Converts a duration of video at the given bitrate (in kbps) into a number of bytes.
+fn video_bytes_for_duration(bitrate_kbps: u32, duration_ms: u64) -> usize {
+    // The bitrate is in kbps, which is close enough to bits per millisecond, so
+    // dividing it by eight gives the number of bytes queued every millisecond.
+    // At least 1 Mbps is assumed so a missing or zero bitrate cannot disable video.
+    (u64::from(bitrate_kbps.max(1000)) * duration_ms / 8) as usize
+}
 
 enum WsData {
     Bytes(Bytes),
@@ -200,6 +212,11 @@ async fn handle_ws(
     let server_codec_mode_support = host.server_codec_mode_support().await?;
     settings.adjust_for_server(server_version, &gfe_version, server_codec_mode_support)?;
 
+    // bound the web socket backlog by a duration of video at the configured bitrate
+    let max_outbound_backlog = video_bytes_for_duration(settings.bitrate, MAX_OUTBOUND_BACKLOG_MS);
+    let resume_outbound_backlog =
+        video_bytes_for_duration(settings.bitrate, RESUME_OUTBOUND_BACKLOG_MS);
+
     // encryption
     let aes_key = AesKey::new_random(&RustCryptoBackend)?;
     let aes_iv = AesIv::new_random(&RustCryptoBackend)?;
@@ -283,6 +300,8 @@ async fn handle_ws(
         ws_channel_sender,
         outbound_backlog,
         dropping_video,
+        max_outbound_backlog,
+        resume_outbound_backlog,
         ws_receiver,
         stream,
         control_config,
@@ -299,6 +318,8 @@ async fn ws_loop(
     mut ws_sender: UnboundedSender<WsData>,
     outbound_backlog: Arc<AtomicUsize>,
     dropping_video: Arc<AtomicBool>,
+    max_outbound_backlog: usize,
+    resume_outbound_backlog: usize,
     mut ws_receiver: MessageStream,
     mut stream: MoonlightStream,
     control_config: ControlPacketConfig,
@@ -345,7 +366,7 @@ async fn ws_loop(
                         let backlog = outbound_backlog.load(Ordering::Relaxed);
 
                         if dropping_video.load(Ordering::Relaxed) {
-                            if !is_idr || backlog > RESUME_OUTBOUND_BACKLOG_BYTES {
+                            if !is_idr || backlog > resume_outbound_backlog {
                                 if is_idr
                                     && let Err(err) = stream.send_raw(ControlPacket::RequestIdr)
                                 {
@@ -356,9 +377,10 @@ async fn ws_loop(
                             }
 
                             dropping_video.store(false, Ordering::Relaxed);
-                        } else if backlog > MAX_OUTBOUND_BACKLOG_BYTES {
+                        } else if backlog > max_outbound_backlog {
                             warn!(
                                 backlog = backlog,
+                                backlog_limit = max_outbound_backlog,
                                 "web socket video backlog too large, dropping video until the next idr"
                             );
                             dropping_video.store(true, Ordering::Relaxed);
